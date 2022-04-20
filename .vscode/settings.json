@@ -1,0 +1,19 @@
+{
+  "cmake.configureOnOpen": false,
+  "cmake.statusbar.advanced": {
+    "debug" : {
+      "visibility": "hidden"
+              },    "launch" : {
+      "visibility": "hidden"
+               },
+    "build" : {
+      "visibility": "default"
+               },
+    "buildTarget" : {
+      "visibility": "hidden"
+               },
+     },
+     "cmake.buildBeforeRun": true,
+     "C_Cpp.default.configurationProvider": "ms-vscode.cmake-tools",
+     "cortex-debug.openocdPath":"D:/software/Pico/openocd-branch-rp2040-f8w14ec-windows/src/openocd.exe"
+}
