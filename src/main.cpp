@@ -34,15 +34,25 @@ static uint32_t framesRouted[4] = {0, 0, 0, 0};
 // fed straight into the same offline analysis tooling. Capacity/window sized
 // generously against the one real capture analyzed so far (~59 edges over
 // ~800us); adjust if a real capture needs more of either.
+//
+// Captures kHuntBatchSize *consecutive* occurrences per button press (not
+// just one) so the dumps can be diffed against each other -- e.g. to check
+// whether the packet cycles per-receiver (see README) by looking for a field
+// that steps 0,1,2,0,1,2... across consecutive captures.
 static constexpr int kHuntCapacity = 600;
 static constexpr uint32_t kHuntWindowUs = 3000;
+static constexpr int kHuntBatchSize = 4;
 static PixelGapReceiver::RawEdge huntBuf[kHuntCapacity];
 static int huntPort = -1;
+static int huntBatchRemaining = 0;
+static int huntBatchIndex = 0;
 
 static void dumpHuntCapture(int port) {
     int n = receivers[port].huntCaptureCount();
     Serial.print("--- falcon hunt capture: port ");
     Serial.print(port);
+    Serial.print(", occurrence ");
+    Serial.print(huntBatchIndex);
     Serial.print(", ");
     Serial.print(n);
     Serial.println(" edges ---");
@@ -177,15 +187,26 @@ void loop() {
         lastButtonState = buttonState;
         if (buttonState == LOW && huntPort < 0) {
             huntPort = 0;
+            huntBatchRemaining = kHuntBatchSize;
+            huntBatchIndex = 0;
             receivers[huntPort].startHunting(huntBuf, kHuntCapacity, kHuntWindowUs);
-            Serial.println("Falcon hunt: listening on port 0 after each frame's reset "
-                            "(may take ~11 frames to land on a packet)...");
+            Serial.print("Falcon hunt: capturing ");
+            Serial.print(kHuntBatchSize);
+            Serial.println(" consecutive post-frame packets on port 0 "
+                            "(may take ~11 frames per packet)...");
         }
     }
     if (huntPort >= 0 && receivers[huntPort].huntCaptureReady()) {
         dumpHuntCapture(huntPort);
         receivers[huntPort].consumeHuntCapture();
-        receivers[huntPort].stopHunting();
-        huntPort = -1;
+        huntBatchIndex++;
+        huntBatchRemaining--;
+        if (huntBatchRemaining > 0) {
+            receivers[huntPort].startHunting(huntBuf, kHuntCapacity, kHuntWindowUs);
+        } else {
+            receivers[huntPort].stopHunting();
+            huntPort = -1;
+            Serial.println("Falcon hunt: batch complete.");
+        }
     }
 }

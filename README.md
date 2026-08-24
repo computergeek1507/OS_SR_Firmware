@@ -77,21 +77,36 @@ the address dial.
     (or the RP2040's own receiver on real hardware, immune to that scope
     probing issue) is needed for a trustworthy byte layout -- see
     "Falcon hunt capture" below.
+  - Open hypothesis: the packet may be per-receiver rather than one fixed
+    payload -- e.g. occurrence N describing the 1st configured virtual
+    receiver, N+1 the 2nd, N+2 the 3rd, cycling. Tested against the scope
+    capture two ways (per-occurrence pulse count: 55-59, no clean grouping;
+    a periodicity score across candidate cycle lengths 1-11 on the decoded
+    bytes: period 3 wasn't the winner) but neither is conclusive given the
+    decode-quality caveat above, and this capture's 3 receivers all shared
+    the same pixel count, so a per-receiver field might be small enough to
+    be lost in the noise anyway. The hunt-capture batch mode below is built
+    to test this cleanly.
 
 #### Falcon hunt capture
 
 `PixelGapReceiver::startHunting()`/`main.cpp`'s `huntBuf`/`dumpHuntCapture()`
-add a debug capture path: hold `PIN_TEST_BUTTON` to arm port 0, which then
+add a debug capture path: press `PIN_TEST_BUTTON` to arm port 0, which then
 re-arms itself every frame, capturing up to `kHuntWindowUs` (3ms) of raw
 level-transition edges starting exactly at that frame's end-of-frame reset.
 Once a capture lands with a non-trivial edge count (i.e. it caught a real
 post-frame burst, not just idle), it's dumped over USB serial in the same
 "Time [s],Channel 0" CSV format an oscilloscope export uses, so it drops
-straight into the same offline analysis tooling used above. Since the config
-packet only appears once every ~11 frames, a single button press can take up
-to ~260ms to land on one. Capture it with `pio device monitor` or any serial
-terminal, save the CSV block between the `---` markers to a file, and re-run
-the same bit-period/framing analysis against it.
+straight into the same offline analysis tooling used above -- then the hunt
+automatically re-arms for the *next* occurrence, `kHuntBatchSize` (4) times
+per button press, so one press yields several consecutive packets to diff
+against each other. This is the way to test whether the packet is per-receiver
+(e.g. cycling 1st/2nd/3rd-receiver config across occurrences, as opposed to
+one fixed periodic packet) -- look for a field that steps 0,1,2,0,... (or
+similar) across the batch. Since each occurrence only appears once every ~11
+frames, a full batch can take ~1 second. Capture it with `pio device monitor`
+or any serial terminal, save each CSV block between the `---` markers to a
+file, and re-run the same bit-period/framing analysis against it.
 
 ### Board addressing
 
