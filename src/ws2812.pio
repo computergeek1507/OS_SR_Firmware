@@ -1,0 +1,28 @@
+;
+; Canonical WS2812/WS281x pixel-output PIO program, as used in the Raspberry
+; Pi pico-examples repo (pico-examples/pio/ws2812). One instruction cycle is
+; configured (via clock divider) to equal 1 "bit-cell" tick; the three phases
+; below produce the standard high/low pulse shapes for a 0 and a 1 bit at
+; whatever bit rate the C-side init function is given (800kHz for WS2812/12B,
+; 400kHz for WS2811/original WS2812).
+;
+; T1: initial HIGH time common to both a 0 and a 1 bit.
+; T2: HIGH time added only for a 1 bit (T1+T2 = total high time for a 1).
+; T3: LOW time common to both (tail of the bit cell).
+
+.program ws2812
+.side_set 1
+
+.define public T1 2
+.define public T2 5
+.define public T3 3
+
+.wrap_target
+bitloop:
+    out x, 1        side 0 [T3 - 1] ; shift out one bit, low for T3
+    jmp !x do_zero  side 1 [T1 - 1] ; branch on the bit we just shifted out
+do_one:
+    jmp bitloop     side 1 [T2 - 1] ; continue high for T2 -> long pulse = 1
+do_zero:
+    nop             side 0 [T2 - 1] ; extend low by T2 -> short pulse = 0
+.wrap

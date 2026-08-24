@@ -1,0 +1,21 @@
+;
+; Raw oversampling capture of one WS281x-style pixel-data input line.
+;
+; Rather than trying to decode WS281x 0/1 bits and FPP v2 inter-segment gaps
+; directly in PIO (which would require baking in exact bit-cell timing we
+; haven't verified against real hardware yet), this program just samples the
+; pin once per clock tick and streams the raw levels out. Bit decoding, gap
+; detection, and end-of-frame detection all happen in software (see
+; PixelGapReceiver), which can adapt to whatever timing shows up on the wire
+; and is far easier to tune/debug without reflashing PIO code.
+;
+; Sample rate is set by the state machine clock divider from the C side
+; (GapCapture::begin). ~4Msps gives ~5 samples per bit at WS2812 (800kHz)
+; timing and ~10 samples per bit at WS2811 (400kHz) timing -- plenty of
+; resolution to classify short vs. long pulses either way.
+
+.program gap_capture
+
+.wrap_target
+    in pins, 1
+.wrap
