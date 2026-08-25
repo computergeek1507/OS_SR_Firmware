@@ -23,7 +23,11 @@ static Ws2812Output outputs[4];
 static bool outputsBegun[4] = {false, false, false, false};
 
 static uint8_t boardAddress = 0;
-static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire, -1);
+// GPIO26/27 (PIN_OLED_SDA/SCL) are I2C1-only pins on the RP2040 -- must use
+// Wire1, not the default Wire (I2C0). Using the wrong instance here isn't
+// just wrong output, it hangs Wire.begin() outright (see README).
+static Adafruit_SSD1306 display(OLED_WIDTH, OLED_HEIGHT, &Wire1, -1);
+static bool oledOk = false;
 
 static uint32_t framesRouted[4] = {0, 0, 0, 0};
 
@@ -118,11 +122,16 @@ static void routeReadyFrames() {
 }
 
 static void updateDisplay() {
+    if (!oledOk) return;
     display.clearDisplay();
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
-    display.print("OS SM RECEIVER  addr:");
+    // Kept on two short lines deliberately: at textSize(1) each char is 6px,
+    // and a single line with both the title and address digit ran past the
+    // 128px-wide display and wrapped/clipped the digit.
+    display.println("OS SM RECEIVER");
+    display.print("addr:");
     display.println(boardAddress);
     for (int i = 0; i < 4; i++) {
         display.print("P");
@@ -134,6 +143,24 @@ static void updateDisplay() {
         display.println("f");
     }
     display.display();
+}
+
+// Debug: blinks PIN_STATUS_LED `n` times then holds it solidly on, and prints
+// a matching line over serial. Called after each setup() stage completes, so
+// if setup() hangs, the LED is left showing (by blink count, no serial
+// terminal needed) the last stage that actually finished.
+static void checkpoint(int n, const char *label) {
+    for (int i = 0; i < n; i++) {
+        digitalWrite(PIN_STATUS_LED, HIGH);
+        delay(120);
+        digitalWrite(PIN_STATUS_LED, LOW);
+        delay(120);
+    }
+    digitalWrite(PIN_STATUS_LED, HIGH);
+    Serial.print("checkpoint ");
+    Serial.print(n);
+    Serial.print(": ");
+    Serial.println(label);
 }
 
 void setup() {
@@ -150,19 +177,31 @@ void setup() {
     pinMode(PIN_STATUS_LED, OUTPUT);
     digitalWrite(PIN_STATUS_LED, LOW);
     pinMode(PIN_TEST_BUTTON, INPUT_PULLUP);
+    checkpoint(1, "pins configured");
 
     boardAddress = readBoardAddress();
+    checkpoint(2, "board address read");
 
-    Wire.setSDA(PIN_OLED_SDA);
-    Wire.setSCL(PIN_OLED_SCL);
-    Wire.begin();
-    display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS);
-    display.setRotation(0);
-    updateDisplay();
-
+    // Pixel routing doesn't depend on the OLED at all, so bring it up first --
+    // an OLED problem (wrong address, unplugged, miswired SDA/SCL) shouldn't
+    // be able to take the actual receiver/output functionality down with it.
     for (int i = 0; i < 4; i++) {
         receivers[i].begin(pio0, kDataPins[i]);
+        checkpoint(3 + i, "receiver started"); // checkpoints 3-6, one per port
     }
+
+    Wire1.setSDA(PIN_OLED_SDA);
+    Wire1.setSCL(PIN_OLED_SCL);
+    Wire1.begin();
+    checkpoint(7, "wire begin");
+
+    oledOk = display.begin(SSD1306_SWITCHCAPVCC, OLED_I2C_ADDRESS);
+    checkpoint(8, oledOk ? "oled begin ok" : "oled begin FAILED");
+    if (oledOk) {
+        display.setRotation(0);
+        updateDisplay();
+    }
+    checkpoint(9, "setup complete");
 }
 
 void loop() {
