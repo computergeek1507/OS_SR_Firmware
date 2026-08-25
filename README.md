@@ -136,14 +136,12 @@ pinpointed exactly which call was hanging without needing a debugger):
   at textSize(1) (6px/char) and clipped/wrapped the address digit -- split
   across two lines instead.
 
-Also confirmed: `DIFF_EN` is active-low (`kEnableActiveHigh = false` in
-`main.cpp`) -- a live Falcon v2 signal on port 1 showed 0 segments/frames
-under active-high and started routing frames as soon as this flipped. Not yet
-independently confirmed: `EN1-4` (currently share the same constant, but
-`framesRouted` incrementing only proves the input side works, not that a
-port's output stage actually drives its LED string) and the dial's polarity
-(no dial populated on the board tested so far, so `boardAddress` reads 0 by
-default -- see `dial.h`).
+Also confirmed on real hardware: `DIFF_EN` and `EN1-4` are both active-low
+(`kEnableActiveHigh = false` in `main.cpp`) -- `DIFF_EN` via a live Falcon v2
+signal on port 1 (0 segments/frames under active-high, started routing as
+soon as this flipped), `EN1-4` confirmed directly. Not yet confirmed: the
+dial's polarity (no dial populated on the board tested so far, so
+`boardAddress` reads 0 by default -- see `dial.h`).
 
 ## Needs real hardware to finish
 
@@ -151,14 +149,11 @@ default -- see `dial.h`).
    real Falcon v2 controller to get a clean, on-device capture of the
    post-pixel-data packet, then reverse-engineer its byte layout -- the scope
    capture analyzed so far isn't reliable enough to decode byte-for-byte.
-2. Confirm `EN1-4`'s active level independently of `DIFF_EN` (currently
-   shares `kEnableActiveHigh` in `main.cpp`, unconfirmed -- see "Hardware
-   bring-up findings" above) by checking a port's actual LED string lights up.
-3. Confirm the dial's electrical polarity once a board with the dial
+2. Confirm the dial's electrical polarity once a board with the dial
    populated is available (currently assumed active-low with internal
    pull-ups -- `dial.h`).
 
-FPP v2 gap/reset thresholds (former item 1) are now verified against a real
-capture -- see "Protocol support" above. Worth revisiting with a longer/busier
-capture (more pixels, more receivers) to widen confidence in the jitter
-ceiling used for `kGapThresholdNs`.
+FPP v2 gap/reset thresholds are verified against a real capture -- see
+"Protocol support" above. Worth revisiting with a longer/busier capture (more
+pixels, more receivers) to widen confidence in the jitter ceiling used for
+`kGapThresholdNs`.
