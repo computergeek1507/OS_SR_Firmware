@@ -129,6 +129,49 @@ public:
     int huntCaptureCount() const { return huntCount_; }
     void consumeHuntCapture() { huntReady_ = false; huntCount_ = 0; }
 
+    // Real-time output path: DATA_n is a pure input -- the LED string is
+    // actually driven by an external buffer (74AHCT1G125) whose input is
+    // wired outside the MCU to this same live bus, and whose output only
+    // reaches the string while `enPin` is asserted. So driving output isn't
+    // "decode a segment, then replay it" -- it's "count gaps as they go by,
+    // and hold the gate open for exactly the live segment matching our
+    // address," done from onLowPulse() as gaps/resets are recognized, with
+    // no dependency on the bit/pixel decode below (that's diagnostic-only,
+    // for the OLED). Call once per receiver right after begin() to assign the
+    // pin, then setTargetSegment()/setDumbMode() to pick a mode -- both of
+    // those are safe to call again later too (e.g. a live dial change), and
+    // take effect immediately (closing the gate now, letting the next
+    // segment-boundary event reopen it correctly) rather than waiting for a
+    // reset to notice.
+    void configureGating(uint enPin, bool enableActiveHigh) {
+        gateEnPin_ = enPin;
+        gateActiveHigh_ = enableActiveHigh;
+        gatingConfigured_ = true;
+    }
+
+    void setTargetSegment(uint8_t targetSegment) {
+        gateTargetSegment_ = targetSegment;
+        gateDumbMode_ = false;
+        gateSegmentIndex_ = 0;
+        setGate(false);
+    }
+
+    // Dumb mode: hold the gate open unconditionally, ignoring segment
+    // boundaries entirely -- passes every virtual receiver's data through
+    // unfiltered. Also the robust choice for a gap-less/direct-feed frame,
+    // unlike a specific target segment (see the gating edge-case note in the
+    // README): it doesn't depend on gaps ever occurring.
+    void setDumbMode() {
+        gateDumbMode_ = true;
+        setGate(true);
+    }
+
+    // For when something else drives EN_n directly, bypassing setGate() (e.g.
+    // Test Mode) -- keeps setGate()'s open/closed bookkeeping accurate so its
+    // redundant-write dedupe doesn't skip a write that's actually needed once
+    // control returns here. Doesn't touch the pin itself.
+    void syncGateState(bool open) { gateOpen_ = open; }
+
 private:
     void resetFrameState() {
         level_ = 0;
@@ -185,14 +228,34 @@ private:
     void onLowPulse(float durationNs) {
         if (durationNs > kResetThresholdNs) {
             // Long reset: end of the whole composite frame.
+            if (gatingConfigured_ && !gateDumbMode_) {
+                setGate(false);
+                gateSegmentIndex_ = 0;
+                // Segment 0 of the *new* frame starts right now -- opening
+                // here (rather than only on a gap) is what makes an address-0
+                // receiver handle a gap-less direct-feed frame correctly too,
+                // since that case never reaches the gap branch below at all.
+                if (gateTargetSegment_ == 0) setGate(true);
+            }
             closeSegment();
             frameReady_ = (segmentCount_ > 0);
             huntOnReset();
         } else if (durationNs > kGapThresholdNs) {
             // Gap: boundary between two virtual receivers' segments.
+            if (gatingConfigured_ && !gateDumbMode_) {
+                if (gateSegmentIndex_ == gateTargetSegment_) setGate(false);
+                gateSegmentIndex_++;
+                if (gateSegmentIndex_ == gateTargetSegment_) setGate(true);
+            }
             closeSegment();
         }
         // Otherwise this is just the normal tail-low of a bit cell -- ignore.
+    }
+
+    void setGate(bool open) {
+        if (open == gateOpen_) return;
+        gateOpen_ = open;
+        digitalWrite(gateEnPin_, open == gateActiveHigh_ ? HIGH : LOW);
     }
 
     void pushBit(uint32_t bit) {
@@ -279,6 +342,14 @@ private:
     uint32_t huntStartUs_ = 0;
     uint32_t huntLevel_ = 2;
     uint32_t huntRunLen_ = 0;
+
+    uint gateEnPin_ = 0;
+    bool gateActiveHigh_ = false;
+    uint8_t gateTargetSegment_ = 0;
+    bool gatingConfigured_ = false;
+    bool gateDumbMode_ = false;
+    int gateSegmentIndex_ = 0;
+    bool gateOpen_ = false;
 
     PIO pio_ = nullptr;
     uint pin_ = 0;

@@ -38,31 +38,85 @@ static uint32_t framesRouted[4] = {0, 0, 0, 0};
 // after a port's pixel data ends (e.g. Falcon v2's undocumented post-frame
 // UART packet -- see README) and dump it over USB serial in the same
 // "Time [s],Channel 0" CSV format an oscilloscope export uses, so it can be
-// fed straight into the same offline analysis tooling. Capacity/window sized
-// generously against the one real capture analyzed so far (~59 edges over
-// ~800us); adjust if a real capture needs more of either.
+// fed straight into the same offline analysis tooling.
+//
+// Window widened to 22ms (2026-08-24): a live capture at the original 3ms
+// window kept getting cut short mid-cycle -- the window-timeout check only
+// runs when an edge arrives, so during a long quiet stretch with no edges it
+// doesn't fire until whatever edge comes next, however much later that is.
+// That accidentally revealed real reset-to-reset periods of ~23.9-24.0ms
+// with a second burst of activity ~16.7ms into the cycle, which a 3ms window
+// can't capture cleanly. 22ms is deliberately just *under* that observed
+// cadence: since huntOnReset() restarts the window on every reset, a window
+// longer than the cadence (e.g. 30ms) would keep getting restarted before it
+// can time out, only completing on the rare larger gap -- 22ms instead times
+// out on nearly every single cycle, ending well before the next reset while
+// still covering the whole span from reset to that second burst and beyond.
 //
 // Captures kHuntBatchSize *consecutive* occurrences per button press (not
 // just one) so the dumps can be diffed against each other -- e.g. to check
 // whether the packet cycles per-receiver (see README) by looking for a field
 // that steps 0,1,2,0,1,2... across consecutive captures.
-static constexpr int kHuntCapacity = 600;
-static constexpr uint32_t kHuntWindowUs = 3000;
-static constexpr int kHuntBatchSize = 4;
+//
+// kHuntBatchSize/kSkipUninteresting: for the Falcon config-packet hunt, bump
+// kHuntBatchSize way up and set kSkipUninteresting true so dumpHuntCapture()
+// only prints the full CSV for an occurrence containing an edge in
+// [kInterestingDurationMinNs, kInterestingDurationMaxNs] (longer than
+// ordinary WS281x bit-cell timing, shorter than a real reset -- i.e.
+// UART-burst-scale, not pixel-scale); everything else gets a one-line
+// summary. For verifying actual pixel *content* (e.g. against a known solid
+// color set on the transmitter), set it false to always get the full dump.
+static constexpr int kHuntCapacity = 1000;
+static constexpr uint32_t kHuntWindowUs = 22000;
+static constexpr int kHuntBatchSize = 3;
+static constexpr bool kSkipUninteresting = false;
+static constexpr uint32_t kInterestingDurationMinNs = 4000;
+static constexpr uint32_t kInterestingDurationMaxNs = 200000;
 static PixelGapReceiver::RawEdge huntBuf[kHuntCapacity];
 static int huntPort = -1;
 static int huntBatchRemaining = 0;
 static int huntBatchIndex = 0;
 
+static void startFalconHunt(int port) {
+    huntPort = port;
+    huntBatchRemaining = kHuntBatchSize;
+    huntBatchIndex = 0;
+    receivers[huntPort].startHunting(huntBuf, kHuntCapacity, kHuntWindowUs);
+    Serial.print("Falcon hunt: capturing ");
+    Serial.print(kHuntBatchSize);
+    Serial.print(" consecutive post-frame packets on port ");
+    Serial.print(port + 1);
+    Serial.println(" (may take ~11 frames per packet)...");
+}
+
 static void dumpHuntCapture(int port) {
     int n = receivers[port].huntCaptureCount();
+
+    uint32_t maxInterestingNs = 0;
+    for (int i = 0; i < n; i++) {
+        uint32_t d = huntBuf[i].durationNs;
+        if (d >= kInterestingDurationMinNs && d <= kInterestingDurationMaxNs && d > maxInterestingNs) {
+            maxInterestingNs = d;
+        }
+    }
+    if (kSkipUninteresting && maxInterestingNs == 0) {
+        Serial.print("occurrence ");
+        Serial.print(huntBatchIndex);
+        Serial.print(": ");
+        Serial.print(n);
+        Serial.println(" edges, nothing unusual (all pixel-scale) -- skipped");
+        return;
+    }
+
     Serial.print("--- falcon hunt capture: port ");
-    Serial.print(port);
+    Serial.print(port + 1);
     Serial.print(", occurrence ");
     Serial.print(huntBatchIndex);
     Serial.print(", ");
     Serial.print(n);
-    Serial.println(" edges ---");
+    Serial.print(" edges, max interesting duration ");
+    Serial.print(maxInterestingNs);
+    Serial.println("ns ---");
     Serial.println("Time [s],Channel 0");
     double t = 0.0;
     for (int i = 0; i < n; i++) {
@@ -72,6 +126,91 @@ static void dumpHuntCapture(int port) {
         t += huntBuf[i].durationNs / 1e9;
     }
     Serial.println("--- end capture ---");
+}
+
+// Applies a dial reading to all 4 receivers' gating -- called once at boot
+// and again on any live dial change (see loop()), and when Test Mode exits.
+// Dial 0 is "dumb mode": EN_n held permanently open rather than gated,
+// passing every segment through unfiltered (also the robust choice for a
+// gap-less/direct-feed frame, unlike a specific non-zero ID -- see the
+// gating edge-case note in the README). Dial 1-6 select "ID 1"-"ID 6"
+// (human-facing, 1-based) against the 0-based segment index gating uses.
+static void applyBoardAddress(uint8_t addr) {
+    boardAddress = addr;
+    for (int i = 0; i < 4; i++) {
+        if (addr == 0) {
+            receivers[i].setDumbMode();
+        } else {
+            receivers[i].setTargetSegment(addr - 1);
+        }
+    }
+}
+
+// Test mode: PIN_TEST_BUTTON toggles this. Disables the shared input receiver
+// (DIFF_EN off) and drives a local WS2812 test pattern out all 4 ports
+// instead, so each port's LED string can be checked without any upstream
+// signal. This is the one place `Ws2812Output`/PIO1-on-the-shared-pin is
+// still used post-refactor -- normal operation gates the live incoming bus
+// through the external 74AHCT1G125 in real time instead (see
+// PixelGapReceiver::configureGating), but that's specifically *not* safe here
+// since it would mean two drivers on the pin; test mode sidesteps that by
+// turning the input receiver off first, so there's only ever one.
+static constexpr int kTestModePixelCount = 300;
+static bool testModeActive = false;
+static uint32_t testPattern[kTestModePixelCount];
+static uint32_t lastTestColorChangeMs = 0;
+static int testColorIndex = -1;
+
+static inline uint32_t grbColor(uint8_t r, uint8_t g, uint8_t b) {
+    return ((uint32_t)g << 16) | ((uint32_t)r << 8) | b;
+}
+
+static void enterTestMode() {
+    testModeActive = true;
+    if (huntPort >= 0) {
+        // Disabling PIO0 input capture below would otherwise strand an
+        // in-progress hunt with no more resets ever arriving to complete it.
+        receivers[huntPort].stopHunting();
+        huntPort = -1;
+    }
+    setEnable(PIN_DIFF_EN, false);
+    for (int i = 0; i < 4; i++) {
+        receivers[i].disable();
+        if (!outputsBegun[i]) {
+            outputs[i].begin(pio1, kDataPins[i]);
+            outputsBegun[i] = true;
+        }
+        setEnable(kEnPins[i], true);
+        receivers[i].syncGateState(true); // EN_n was just driven directly above
+    }
+    testColorIndex = -1; // force an immediate color set on the next service call
+    Serial.println("Test mode: ON");
+}
+
+static void exitTestMode() {
+    testModeActive = false;
+    for (int i = 0; i < 4; i++) {
+        receivers[i].enable(); // reclaims the pin for PIO0 input
+    }
+    // Re-applies (rather than a raw setEnable) so each receiver's gate
+    // bookkeeping -- left accurately "open" by enterTestMode()'s
+    // syncGateState() above -- drives a real write where one's actually
+    // needed instead of a stale dedupe skipping it.
+    applyBoardAddress(boardAddress);
+    setEnable(PIN_DIFF_EN, true);
+    Serial.println("Test mode: OFF");
+}
+
+static void serviceTestMode() {
+    uint32_t now = millis();
+    if (testColorIndex >= 0 && now - lastTestColorChangeMs < 1000) return;
+    lastTestColorChangeMs = now;
+    testColorIndex = (testColorIndex + 1) % 3;
+    uint32_t color = testColorIndex == 0 ? grbColor(255, 0, 0)
+                    : testColorIndex == 1 ? grbColor(0, 255, 0)
+                                           : grbColor(0, 0, 255);
+    for (int i = 0; i < kTestModePixelCount; i++) testPattern[i] = color;
+    for (int port = 0; port < 4; port++) outputs[port].show(testPattern, kTestModePixelCount);
 }
 
 // Runs continuously on core1: just drains the 4 receivers' PIO FIFOs so the
@@ -85,42 +224,18 @@ void loop1() {
     }
 }
 
+// Output is driven in real time by PixelGapReceiver's gap-counting gate (see
+// PixelGapReceiver::configureGating) as segments go by on DATA_n -- it needs
+// no help from here. This is just diagnostic bookkeeping for the OLED: note
+// that framesRouted now counts every fully-decoded frame, not only ones where
+// this port's address matched a segment (the gate itself is address-aware;
+// this counter no longer needs to be).
 static void routeReadyFrames() {
     for (int port = 0; port < 4; port++) {
         if (!receivers[port].frameReady()) continue;
-
-        int segCount = receivers[port].segmentCount();
-        const PixelGapReceiver::Segment *segs = receivers[port].segments();
-        const uint32_t *px = receivers[port].pixels();
-
-        // No gaps at all -> this port's whole frame is ours regardless of
-        // dial address (direct point-to-point feed, not a multi-drop chain).
-        int chosen = -1;
-        if (segCount == 1) {
-            chosen = 0;
-        } else if (boardAddress < segCount) {
-            chosen = boardAddress;
-        }
-
-        if (chosen >= 0) {
-            receivers[port].disable();
-
-            if (!outputsBegun[port]) {
-                outputs[port].begin(pio1, kDataPins[port]);
-                outputsBegun[port] = true;
-            }
-            setEnable(kEnPins[port], true);
-            outputs[port].show(px + segs[chosen].startPixel, segs[chosen].count);
-            setEnable(kEnPins[port], false);
-
-            receivers[port].consumeFrame();
-            receivers[port].enable();
-            framesRouted[port]++;
-        } else {
-            // Gap protocol is active but no segment matches our address --
-            // just drop the frame and go back to listening.
-            receivers[port].consumeFrame();
-        }
+        framesRouted[port]++;
+        receivers[port].consumeFrame();
+        receivers[port].enable();
     }
 }
 
@@ -130,12 +245,25 @@ static void updateDisplay() {
     display.setTextSize(1);
     display.setTextColor(SSD1306_WHITE);
     display.setCursor(0, 0);
+    if (testModeActive) {
+        display.println("TEST MODE");
+        display.println("local RGB cycle,");
+        display.println("input disabled.");
+        display.println("Press button to");
+        display.println("return to normal.");
+        display.display();
+        return;
+    }
     // Kept on two short lines deliberately: at textSize(1) each char is 6px,
     // and a single line with both the title and address digit ran past the
     // 128px-wide display and wrapped/clipped the digit.
     display.println("OS SM RECEIVER");
-    display.print("addr:");
-    display.println(boardAddress);
+    if (boardAddress == 0) {
+        display.println("addr:0 (dumb)");
+    } else {
+        display.print("addr:");
+        display.println(boardAddress);
+    }
     for (int i = 0; i < 4; i++) {
         display.print("P");
         display.print(i + 1);
@@ -190,8 +318,10 @@ void setup() {
     // be able to take the actual receiver/output functionality down with it.
     for (int i = 0; i < 4; i++) {
         receivers[i].begin(pio0, kDataPins[i]);
+        receivers[i].configureGating(kEnPins[i], kEnableActiveHigh);
         checkpoint(3 + i, "receiver started"); // checkpoints 3-6, one per port
     }
+    applyBoardAddress(boardAddress);
 
     Wire1.setSDA(PIN_OLED_SDA);
     Wire1.setSCL(PIN_OLED_SCL);
@@ -208,34 +338,59 @@ void setup() {
 }
 
 void loop() {
-    routeReadyFrames();
+    if (testModeActive) {
+        serviceTestMode();
+    } else {
+        routeReadyFrames();
+    }
 
     static uint32_t lastDisplay = 0;
     uint32_t now = millis();
     if (now - lastDisplay > 250) {
         lastDisplay = now;
+        // Live dial: not meaningful mid-Test-Mode (gating is disabled and
+        // EN1-4 are forced on there regardless), so skip while active --
+        // applyBoardAddress() would otherwise fight that by writing EN_n via
+        // the gate.
+        if (!testModeActive) {
+            uint8_t addr = readBoardAddress();
+            if (addr != boardAddress) {
+                applyBoardAddress(addr);
+                Serial.print("Board address changed to ");
+                Serial.println(addr);
+            }
+        }
         updateDisplay();
         digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
     }
 
-    // Debug: PIN_TEST_BUTTON press starts a Falcon-hunt capture on port 0
-    // (see comment at huntBuf above). Debounced; ignored while a hunt is
-    // already in progress.
+    // PIN_TEST_BUTTON toggles Test Mode (see enterTestMode/exitTestMode).
+    // Falcon-hunt capture (see comment at huntBuf above) is serial-triggered
+    // only now -- '1'-'4' selects a port, any other byte defaults to port 1.
     static bool lastButtonState = HIGH;
     static uint32_t lastButtonChangeMs = 0;
     bool buttonState = digitalRead(PIN_TEST_BUTTON);
     if (buttonState != lastButtonState && (now - lastButtonChangeMs) > 50) {
         lastButtonChangeMs = now;
         lastButtonState = buttonState;
-        if (buttonState == LOW && huntPort < 0) {
-            huntPort = 0;
-            huntBatchRemaining = kHuntBatchSize;
-            huntBatchIndex = 0;
-            receivers[huntPort].startHunting(huntBuf, kHuntCapacity, kHuntWindowUs);
-            Serial.print("Falcon hunt: capturing ");
-            Serial.print(kHuntBatchSize);
-            Serial.println(" consecutive post-frame packets on port 0 "
-                            "(may take ~11 frames per packet)...");
+        if (buttonState == LOW) {
+            if (testModeActive) {
+                exitTestMode();
+            } else {
+                enterTestMode();
+            }
+        }
+    }
+    while (Serial.available() > 0) {
+        char c = (char)Serial.read();
+        // No point hunting while test mode has PIO0 input capture disabled --
+        // no resets will ever fire to advance/complete the capture.
+        if (huntPort < 0 && !testModeActive) {
+            if (c >= '1' && c <= '4') {
+                startFalconHunt(c - '1');
+            } else if (c != '\r' && c != '\n') {
+                startFalconHunt(0);
+            }
         }
     }
     if (huntPort >= 0 && receivers[huntPort].huntCaptureReady()) {

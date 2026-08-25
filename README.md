@@ -17,25 +17,53 @@ pio run -t upload # build + flash
 
 ## Architecture
 
-Each of the board's 4 ports shares one GPIO pin for both directions:
+`DATA_n` is a **pure input** at all times -- a dedicated PIO state machine
+(`gap_capture.pio`, `pio0`) oversamples the pin and streams raw levels to
+`PixelGapReceiver`, which classifies inter-segment gaps / end-of-frame resets
+in software (see `src/PixelGapReceiver.h` for why this is done in software
+rather than in PIO). The RP2040 never drives this pin.
 
-- **DATA_n (input):** a dedicated PIO state machine (`gap_capture.pio`,
-  `pio0`) oversamples the pin and streams raw levels to `PixelGapReceiver`,
-  which decodes WS281x bits and classifies inter-segment gaps / end-of-frame
-  resets in software (see `src/PixelGapReceiver.h` for why this is done in
-  software rather than in PIO).
-- **DOUT_n (output):** once a frame's segments are decoded, the matching
-  segment is driven back out the same pin via a second PIO state machine
-  (`ws2812.pio`, `pio1`) through `Ws2812Output` -- the canonical
-  pico-examples WS2812 program, unmodified.
+The actual `DOUT_n` (LED string output) is driven by an external
+**74AHCT1G125** single-gate buffer per port, wired *outside* the MCU: its
+input is the same live incoming bus as `DATA_n`, and its output only reaches
+the string while its enable pin (`EN_n`) is asserted. So driving output isn't
+"decode a segment, then replay it" -- `PixelGapReceiver` counts gaps as they
+go by on `DATA_n` in real time and holds `EN_n` low for exactly the duration
+of the segment matching this board's address (`configureGating()` assigns
+each receiver's `EN_n` pin once in `setup()`; `setTargetSegment()`/
+`setDumbMode()` pick the actual addressing and are safe to call again any
+time -- see "Board addressing" below for the live dial polling that does
+exactly that), letting the live bits flow straight through the buffer with
+no decode/regenerate step. `pixels()`/`segments()` are decoded purely for the
+OLED diagnostic display; they don't drive output.
 
-`EN1-4` gate each port's output driver (only asserted while actively writing
-DOUT_n) and `DIFF_EN` gates the shared input differential receiver for all 4
-DATA pins.
+Known limitation of real-time gating: a non-zero board address on a frame
+with *no* gaps at all (a direct point-to-point feed, not a multi-drop chain)
+can't be gated correctly, since "no gaps occurred" is only known once the
+frame's final reset arrives -- by then the addressed window already passed.
+Accepted tradeoff: a non-zero dial address wouldn't normally be paired with a
+single-receiver direct feed anyway.
+
+`DIFF_EN` gates the shared input differential receiver for all 4 `DATA_n`
+pins (always on during normal operation).
 
 Core1 (`setup1`/`loop1`) does nothing but drain the 4 receivers' PIO FIFOs;
-core0 handles routing decoded frames to outputs, the OLED status display, and
-the address dial.
+core0 handles diagnostic bookkeeping for the OLED status display, Test Mode,
+and the address dial -- the actual output gating happens directly inside
+`PixelGapReceiver` on core1 as gaps/resets are recognized, independent of
+whatever core0 happens to be doing.
+
+### Test Mode
+
+`PIN_TEST_BUTTON` toggles Test Mode: de-asserts `DIFF_EN` (disabling the
+input receiver), asserts all four `EN1-4`, and drives a local 300-pixel
+solid red/green/blue cycle (`kTestModePixelCount`, ~1s per color) out all 4
+ports via `Ws2812Output`/`pio1` -- the same PIO-generate-and-drive mechanism
+normal operation deliberately avoids (see above). It's safe here specifically
+*because* `DIFF_EN` is off: with the input receiver disabled there's no live
+signal on the bus to contend with, so the RP2040 can safely reclaim the
+shared pin as an output. Lets each port's LED string be checked without any
+upstream signal. Press the button again to return to normal operation.
 
 ### Protocol support
 
@@ -91,7 +119,7 @@ the address dial.
 #### Falcon hunt capture
 
 `PixelGapReceiver::startHunting()`/`main.cpp`'s `huntBuf`/`dumpHuntCapture()`
-add a debug capture path: press `PIN_TEST_BUTTON` to arm port 0, which then
+add a debug capture path: trigger it (see below) to arm a port, which then
 re-arms itself every frame, capturing up to `kHuntWindowUs` (3ms) of raw
 level-transition edges starting exactly at that frame's end-of-frame reset.
 Once a capture lands with a non-trivial edge count (i.e. it caught a real
@@ -99,23 +127,48 @@ post-frame burst, not just idle), it's dumped over USB serial in the same
 "Time [s],Channel 0" CSV format an oscilloscope export uses, so it drops
 straight into the same offline analysis tooling used above -- then the hunt
 automatically re-arms for the *next* occurrence, `kHuntBatchSize` (4) times
-per button press, so one press yields several consecutive packets to diff
-against each other. This is the way to test whether the packet is per-receiver
-(e.g. cycling 1st/2nd/3rd-receiver config across occurrences, as opposed to
-one fixed periodic packet) -- look for a field that steps 0,1,2,0,... (or
+per trigger, so one trigger yields several consecutive packets to diff against
+each other. This is the way to test whether the packet is per-receiver (e.g.
+cycling 1st/2nd/3rd-receiver config across occurrences, as opposed to one
+fixed periodic packet) -- look for a field that steps 0,1,2,0,... (or
 similar) across the batch. Since each occurrence only appears once every ~11
 frames, a full batch can take ~1 second. Capture it with `pio device monitor`
 or any serial terminal, save each CSV block between the `---` markers to a
 file, and re-run the same bit-period/framing analysis against it.
 
+Trigger it by sending a byte over serial: `'1'`-`'4'` selects the port
+(1-indexed), any other byte defaults to port 1. `PIN_TEST_BUTTON` is no
+longer wired to this -- it now toggles Test Mode (see "Test Mode" above)
+instead. (Earlier real-hardware testing suspected the button itself was
+unresponsive, but it turned out to work fine -- there just wasn't a debug
+print visible without a serial monitor already open to show a press had
+registered; the serial trigger was added as this feature's primary path
+regardless, since it doesn't depend on the button either way.)
+
 ### Board addressing
 
 `SW1` (Nidec Copal SH-7010 rotary switch) sets a single board address used
-identically by all 4 ports: each port's incoming stream is checked for gap
-segments, and the segment at index `boardAddress` is treated as this port's
-own data. If a port's stream has no gaps at all, the whole frame is used
-regardless of dial position (direct point-to-point feed). Only the
-weight-1/2/4 pins are wired, so valid addresses are 0-7.
+identically by all 4 ports. Only the weight-1/2/4 pins are wired, so valid
+positions are 0-7:
+
+- **0 -- dumb mode:** `EN_n` is held permanently open rather than gated to
+  any one segment, passing every virtual receiver's data through unfiltered.
+  Also the robust choice for a direct point-to-point feed (no gap protocol,
+  a single segment) -- unlike a specific non-zero ID, it doesn't depend on
+  gaps ever occurring.
+- **1-6 -- ID 1 through ID 6:** human-facing, 1-based; `EN_n` gates open only
+  for the matching 0-based segment index (`boardAddress - 1`) as gaps are
+  counted in real time. See "Architecture" above for how the gating itself
+  works, including its one known edge case.
+- **7:** follows the same `boardAddress - 1` mapping (segment index 6) for
+  consistency, though not a case that's been explicitly exercised.
+
+The dial is read **live**: `loop()` polls it every ~250ms (piggybacked on the
+OLED refresh) and re-applies it (`applyBoardAddress()` in `main.cpp`) on any
+change, so a physical dial turn takes effect within that poll interval --
+no reset required. Not polled while Test Mode is active (gating is disabled
+and `EN1-4` are forced on there regardless); the last-known address is
+re-applied automatically when Test Mode exits.
 
 ## Hardware bring-up findings (2026-08-24)
 
@@ -143,13 +196,30 @@ soon as this flipped), `EN1-4` confirmed directly. Not yet confirmed: the
 dial's polarity (no dial populated on the board tested so far, so
 `boardAddress` reads 0 by default -- see `dial.h`).
 
+Also corrected: the original implementation had `DATA_n` doing double duty as
+both input (via the differential receiver) and output (regenerating a
+segment's WS2812 waveform via a second PIO block and driving it back out the
+*same* pin). That's not how this board is actually wired -- `DOUT_n` is
+driven by an external 74AHCT1G125 buffer fed by the same live bus, gated by
+`EN_n`, entirely outside the MCU. Replaced with real-time gap-counted `EN_n`
+gating; see "Architecture" above. `framesRouted` (shown on the OLED) changed
+meaning as a result -- it now counts every fully-decoded frame on a port, not
+only ones where this board's address happened to match a segment, since
+addressing is now handled by the gate itself rather than by choosing what to
+replay.
+
 ## Needs real hardware to finish
 
-1. Run the Falcon hunt capture (see "Falcon hunt capture" above) against a
+1. Verify the real-time `EN_n` gating: with a scope on `EN_n` vs `DATA_n`,
+   confirm `EN_n` pulses low for exactly the duration of the segment matching
+   `boardAddress`. Not verifiable from this session alone -- no LEDs were
+   connected to check visually, and this specific behavior wasn't exercised
+   before the architecture correction.
+2. Run the Falcon hunt capture (see "Falcon hunt capture" above) against a
    real Falcon v2 controller to get a clean, on-device capture of the
    post-pixel-data packet, then reverse-engineer its byte layout -- the scope
    capture analyzed so far isn't reliable enough to decode byte-for-byte.
-2. Confirm the dial's electrical polarity once a board with the dial
+3. Confirm the dial's electrical polarity once a board with the dial
    populated is available (currently assumed active-low with internal
    pull-ups -- `dial.h`).
 
