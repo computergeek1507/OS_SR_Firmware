@@ -117,16 +117,46 @@ own data. If a port's stream has no gaps at all, the whole frame is used
 regardless of dial position (direct point-to-point feed). Only the
 weight-1/2/4 pins are wired, so valid addresses are 0-7.
 
+## Hardware bring-up findings (2026-08-24)
+
+First real-hardware bring-up surfaced two firmware bugs neither the scope
+captures nor a desk review caught, both root-caused live via boot checkpoint
+diagnostics (`checkpoint()` in `main.cpp`: blinks `PIN_STATUS_LED` N times
+then holds solid, and logs over serial, after each `setup()` stage --
+pinpointed exactly which call was hanging without needing a debugger):
+
+- `setup()` hung indefinitely in `Wire.begin()`. `PIN_OLED_SDA`/`PIN_OLED_SCL`
+  (GPIO26/27) are I2C1-only pins on the RP2040, but the display was wired to
+  the default `Wire` object, which arduino-pico maps to I2C0 -- fixed by
+  switching to `Wire1`. `setup()` was also reordered so receiver/pixel-routing
+  init happens before the OLED, so an OLED fault can't take the rest of the
+  board down with it, and display calls are now guarded behind whether
+  `display.begin()` actually succeeded.
+- The `"OS SM RECEIVER  addr:N"` status line ran past the 128px display width
+  at textSize(1) (6px/char) and clipped/wrapped the address digit -- split
+  across two lines instead.
+
+Also confirmed: `DIFF_EN` is active-low (`kEnableActiveHigh = false` in
+`main.cpp`) -- a live Falcon v2 signal on port 1 showed 0 segments/frames
+under active-high and started routing frames as soon as this flipped. Not yet
+independently confirmed: `EN1-4` (currently share the same constant, but
+`framesRouted` incrementing only proves the input side works, not that a
+port's output stage actually drives its LED string) and the dial's polarity
+(no dial populated on the board tested so far, so `boardAddress` reads 0 by
+default -- see `dial.h`).
+
 ## Needs real hardware to finish
 
 1. Run the Falcon hunt capture (see "Falcon hunt capture" above) against a
    real Falcon v2 controller to get a clean, on-device capture of the
    post-pixel-data packet, then reverse-engineer its byte layout -- the scope
    capture analyzed so far isn't reliable enough to decode byte-for-byte.
-2. Confirm `EN1-4` / `DIFF_EN` active level (currently assumed active-high --
-   `kEnableActiveHigh` in `main.cpp`).
-3. Confirm the dial's electrical polarity (currently assumed active-low with
-   internal pull-ups -- `dial.h`).
+2. Confirm `EN1-4`'s active level independently of `DIFF_EN` (currently
+   shares `kEnableActiveHigh` in `main.cpp`, unconfirmed -- see "Hardware
+   bring-up findings" above) by checking a port's actual LED string lights up.
+3. Confirm the dial's electrical polarity once a board with the dial
+   populated is available (currently assumed active-low with internal
+   pull-ups -- `dial.h`).
 
 FPP v2 gap/reset thresholds (former item 1) are now verified against a real
 capture -- see "Protocol support" above. Worth revisiting with a longer/busier

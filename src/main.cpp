@@ -9,8 +9,13 @@
 #include "PixelGapReceiver.h"
 #include "ws2812_output.h"
 
-// TODO(verify on hardware): active level for DIFF_EN / EN1-4.
-static constexpr bool kEnableActiveHigh = true;
+// DIFF_EN confirmed active-low on real hardware (2026-08-24): port 1 showed
+// 0 segments/frames against a live signal under active-high, and started
+// routing frames as soon as this flipped to false. EN1-4 share this same
+// constant but aren't independently confirmed yet -- framesRouted ticking up
+// only proves the input side works, not that a port's output stage actually
+// drives its LED string correctly.
+static constexpr bool kEnableActiveHigh = false;
 static inline void setEnable(uint pin, bool on) {
     digitalWrite(pin, on == kEnableActiveHigh ? HIGH : LOW);
 }
