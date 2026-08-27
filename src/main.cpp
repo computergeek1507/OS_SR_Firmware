@@ -355,8 +355,13 @@ void setup() {
     pinMode(PIN_TEST_BUTTON, INPUT_PULLUP);
     checkpoint(1, "pins configured");
 
+#if defined(FIXED_BOARD_ID)
+    boardAddress = FIXED_BOARD_ID; // no dial populated -- see BoardConfig.h
+    checkpoint(2, "board address fixed");
+#else
     boardAddress = readBoardAddress();
     checkpoint(2, "board address read");
+#endif
 
     // Pixel routing doesn't depend on the OLED at all, so bring it up first --
     // an OLED problem (wrong address, unplugged, miswired SDA/SCL) shouldn't
@@ -368,6 +373,7 @@ void setup() {
     }
     applyBoardAddress(boardAddress);
 
+#if !defined(NO_OLED)
     Wire1.setSDA(PIN_OLED_SDA);
     Wire1.setSCL(PIN_OLED_SCL);
     Wire1.begin();
@@ -379,6 +385,12 @@ void setup() {
         display.setRotation(0);
         updateDisplay();
     }
+#else
+    // oledOk stays false -- updateDisplay() already no-ops on that, so no
+    // other guards are needed anywhere else in this file.
+    checkpoint(7, "oled skipped (NO_OLED)");
+    checkpoint(8, "oled skipped (NO_OLED)");
+#endif
     checkpoint(9, "setup complete");
 }
 
@@ -411,6 +423,7 @@ void loop() {
     uint32_t now = millis();
     if (now - lastDisplay > 250) {
         lastDisplay = now;
+#if !defined(FIXED_BOARD_ID)
         // Live dial: not meaningful mid-Test-Mode (gating is disabled and
         // EN1-4 are forced on there regardless), so skip while active --
         // applyBoardAddress() would otherwise fight that by writing EN_n via
@@ -423,6 +436,7 @@ void loop() {
                 Serial.println(addr);
             }
         }
+#endif
         updateDisplay();
         digitalWrite(PIN_STATUS_LED, !digitalRead(PIN_STATUS_LED));
     }
