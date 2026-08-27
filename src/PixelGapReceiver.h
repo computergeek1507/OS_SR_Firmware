@@ -200,24 +200,49 @@ public:
     // itself for the burst that follows.
     bool suspectedFalconV2() const { return sawFalconBurst_; }
 
-    // Which of the board's 4 physical ports this instance is (0-3). Needed
-    // to pick this receiver's own column out of the decoded info packet's
-    // per-port channel table (see finishInfoPacketDecode()) -- call once
-    // from setup(), alongside configureGating().
-    void setFalconPortIndex(uint8_t portIndex) { falconPortIndex_ = portIndex; }
-
     // One-shot (like frameReady()/huntCaptureReady()): true once a fresh
-    // info packet has been captured and passed its sync check, whether or
-    // not it ended up changing this receiver's gating (e.g. dumb-mode ports
-    // decode it but don't act on it). Meant for a temporary bring-up dump
-    // (see main.cpp) to verify the byte layout against known configuration
-    // on real hardware; not needed for gating itself, which applies
-    // immediately inside finishInfoPacketDecode().
+    // info packet has been captured and passed its sync check. Meant for a
+    // temporary bring-up dump (see main.cpp) to verify the byte layout
+    // against known configuration on real hardware; not needed for gating
+    // itself -- see falconTableReady()/applyFalconChannels() below.
     bool falconInfoReady() const { return falconInfoReady_; }
     void consumeFalconInfo() { falconInfoReady_ = false; }
     static constexpr int kFalconInfoByteCount = 57;
     const uint8_t *falconInfoBytes() const { return uartByteBuf_; }
     GateMode gateMode() const { return gateMode_; }
+
+    // The info packet only ever arrives on one physical port (confirmed on
+    // real hardware -- see README), but its 24-word channel table covers
+    // all 4 ports' chain positions. So decoding (this class, per-instance,
+    // armed off this instance's own marker) and applying (below) are split:
+    // whichever instance actually decodes a valid table exposes it here,
+    // one-shot like falconInfoReady() above, and the caller (main.cpp) is
+    // responsible for calling applyFalconChannels() on *all four* receiver
+    // instances with that same table, each passing its own port index.
+    static constexpr int kFalconChannelWordCount = 24;
+    bool falconTableReady() const { return falconTableReady_; }
+    void consumeFalconTable() { falconTableReady_ = false; }
+    const uint16_t *falconChannels() const { return falconChannels_; }
+
+    // Applies a previously-decoded 24-word channel table (see above) to
+    // *this* receiver's own gating, self-selecting its column via the
+    // board's dial ID (gateTargetSegment_, already set by
+    // setTargetSegment()) and the given port index (0-3, this receiver's
+    // own position among the board's 4 physical ports -- the caller knows
+    // this since it owns the receivers[] array; this class doesn't need to
+    // track it separately). Same dumb-mode/refresh-not-latch/sentinel
+    // behavior previously inline in finishInfoPacketDecode().
+    void applyFalconChannels(const uint16_t *channels, uint8_t portIndex) {
+        if (gateMode_ == GateMode::kDumb) return;
+        uint8_t letterIdx = gateTargetSegment_;
+        if (letterIdx >= 6) return;
+        int idx = letterIdx * 4 + portIndex;
+        uint16_t endCh = channels[idx];
+        if (endCh == 0xFFFF) return; // this chain position isn't configured
+        uint16_t startCh = (letterIdx == 0) ? 0 : channels[idx - 4];
+        if (endCh <= startCh) return; // corrupt/implausible table, discard
+        setPixelRangeGating(startCh / 3, (endCh - startCh) / 3); // RGB: 3 channels/pixel
+    }
 
     // 0=completed all 57 bytes (check falconInfoBytes()[0] for sync pass/
     // fail), 1=bad start bit, 2=bad stop bit, 3=timed out mid-burst, 4=byte
@@ -312,7 +337,6 @@ private:
     // into a standard start/8-data/stop-bit byte framer.
     static constexpr float kFalconBitPeriodNs = 1250.0f;
     static constexpr uint8_t kFalconSyncByte = 0xAA;
-    static constexpr int kFalconChannelWords = 24; // (57 - 9) / 2
     static constexpr uint32_t kFalconUartTimeoutUs = 2000; // >> ~712us expected
 
     void startInfoPacketCapture() {
@@ -393,29 +417,17 @@ private:
     // (this board's dial ID, 0-based) across the board's 4 physical ports --
     // confirmed against a real capture with a known 5-pixel receiver (byte
     // order gave exactly 15 channels = 5 * 3; big-endian gave a nonsensical
-    // 1280).
+    // 1280). Only decodes into falconChannels_ here -- see
+    // applyFalconChannels() for why applying it to gating is the caller's
+    // job, not this function's.
     void finishInfoPacketDecode() {
         falconInfoReady_ = true; // available for the bring-up dump either way
         if (uartByteBuf_[0] != kFalconSyncByte) { falconAbortReason_ = 4; return; }
-        // Dumb mode intentionally wants everything unfiltered -- leave it
-        // alone. Otherwise apply on every valid decode, not just the first:
-        // once switched to kPixelRange (below), keep refreshing the range
-        // in case the show's channel counts change later, rather than
-        // latching the *values* -- only the *mode* switch is one-way.
-        if (gateMode_ == GateMode::kDumb) return;
-        uint8_t letterIdx = gateTargetSegment_;
-        if (letterIdx >= 6) return;
-        uint16_t channels[kFalconChannelWords];
-        for (int w = 0; w < kFalconChannelWords; w++) {
+        for (int w = 0; w < kFalconChannelWordCount; w++) {
             int off = 9 + w * 2;
-            channels[w] = ((uint16_t)uartByteBuf_[off + 1] << 8) | uartByteBuf_[off];
+            falconChannels_[w] = ((uint16_t)uartByteBuf_[off + 1] << 8) | uartByteBuf_[off];
         }
-        int idx = letterIdx * 4 + falconPortIndex_;
-        uint16_t endCh = channels[idx];
-        if (endCh == 0xFFFF) return; // this chain position isn't configured
-        uint16_t startCh = (letterIdx == 0) ? 0 : channels[idx - 4];
-        if (endCh <= startCh) return; // corrupt/implausible table, discard
-        setPixelRangeGating(startCh / 3, (endCh - startCh) / 3); // RGB: 3 channels/pixel
+        falconTableReady_ = true;
     }
 
     bool uartActive_ = false;
@@ -425,10 +437,11 @@ private:
     uint8_t uartByteBuf_[kFalconInfoByteCount];
     int uartByteIndex_ = 0;
     uint32_t uartStartUs_ = 0;
-    uint8_t falconPortIndex_ = 0;
     bool falconInfoReady_ = false;
     uint8_t falconAbortReason_ = 0;
     int falconAbortByteIndex_ = 0;
+    bool falconTableReady_ = false;
+    uint16_t falconChannels_[kFalconChannelWordCount];
 
     void onLowPulse(float durationNs) {
         if (uartActive_) {

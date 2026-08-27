@@ -364,7 +364,6 @@ void setup() {
     for (int i = 0; i < 4; i++) {
         receivers[i].begin(pio0, kDataPins[i]);
         receivers[i].configureGating(kEnPins[i], kEnableActiveHigh);
-        receivers[i].setFalconPortIndex(i);
         checkpoint(3 + i, "receiver started"); // checkpoints 3-6, one per port
     }
     applyBoardAddress(boardAddress);
@@ -393,6 +392,18 @@ void loop() {
                 dumpFalconInfo(i);
                 receivers[i].consumeFalconInfo();
             }
+        }
+        // The info packet only arrives on port 1 (confirmed on real
+        // hardware -- see README), but its table covers all 4 ports' own
+        // chain positions, so whichever receiver actually decodes it (in
+        // practice, always receivers[0]) is applied to every receiver here,
+        // each self-selecting its own column via its own port index.
+        if (receivers[0].falconTableReady()) {
+            const uint16_t *channels = receivers[0].falconChannels();
+            for (int i = 0; i < 4; i++) {
+                receivers[i].applyFalconChannels(channels, i);
+            }
+            receivers[0].consumeFalconTable();
         }
     }
 

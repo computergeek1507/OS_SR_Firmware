@@ -100,15 +100,25 @@ upstream signal. Press the button again to return to normal operation.
   now also arms an inline UART deserializer that decodes the info packet
   live (800000 baud, i.e. `kFalconBitPeriodNs` = 1.25us/bit in
   `PixelGapReceiver.h` -- the same 800kHz rate as the WS2812 pixel data
-  itself, presumably so the transmitter can drive both off one clock) and
-  calls `setPixelRangeGating()` with this receiver's actual computed range,
-  self-selected using the board's dial ID and each port's own index. The
-  16-bit channel-count fields are little-endian (confirmed against a real
-  capture with a known 5-pixel receiver -- see below). A sync/validation
-  check discards any single corrupted occurrence rather than risking a
-  garbage gating window; the packet repeats often enough that this costs
-  nothing. `F` on the OLED still flags a port as Falcon-suspected the same
-  as before.
+  itself, presumably so the transmitter can drive both off one clock). Each
+  receiver instance can decode independently, but on real hardware the info
+  packet has only ever been observed arriving on port 1 -- its 24-word
+  channel table still covers all 4 ports' own chain positions, though, so
+  `finishInfoPacketDecode()` just decodes and exposes the table
+  (`falconTableReady()`/`falconChannels()`) rather than applying it to
+  itself; `main.cpp`'s `loop()` takes whichever receiver's table came in
+  (in practice `receivers[0]`, port 1) and calls
+  `PixelGapReceiver::applyFalconChannels(channels, portIndex)` on *all four*
+  receivers, each self-selecting its own column via its own port index and
+  the board's dial ID. The 16-bit channel-count fields are little-endian
+  (confirmed against a real capture with a known 5-pixel receiver -- see
+  below). A sync/validation check discards any single corrupted occurrence
+  rather than risking a garbage gating window; the packet repeats often
+  enough that this costs nothing. `F` on the OLED still flags a port as
+  Falcon-suspected the same as before. FPP v2's gap-counting, by contrast,
+  is and remains fully independent per port -- unaffected by any of this,
+  each of the 4 receivers counts its own gaps off its own `DATA_n` line with
+  no cross-port dependency.
   Used a scope capture (per-byte decode with framing-error flags, known
   single-receiver/5-pixel test config, saved under `captures/`): every
   occurrence decoded with zero framing errors at the
