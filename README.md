@@ -83,38 +83,46 @@ upstream signal. Press the button again to return to normal operation.
   affect the gap/reset thresholds above (those come from the low-pulse
   durations *between* segments, not from how many pixels are in them), but a
   fuller capture would be needed to validate per-pixel decode.
-- **Falcon v2 (UART-framed config packet):** not implemented. Timing/framing
-  analyzed against a real scope capture (2026-08-23, 275 frames / 6.68s):
-  - Frame period is a steady ~23.39ms (~42.8Hz).
-  - The config packet is *not* sent every frame -- it appears on exactly
-    every 11th frame (~257ms / ~3.9Hz), confirmed identically across all 25
-    occurrences in the capture.
-  - Each occurrence: pixel data ends, ~20.5us low, ~54us high (idle/mark),
-    then a short (~800us) burst of UART-scale activity, then the long
-    inter-frame idle.
-  - The exact byte encoding is **not** reliably recovered from this capture.
-    A bit-period sweep (scored by valid start/stop framing, consistent
-    across all 25 occurrences) found two competing candidates -- ~8.15us/bit
-    (~122.9kbaud) and ~6.2us/bit (~161kbaud) -- but decoding at the
-    stronger-scoring ~6.2us candidate produces bytes that are bit-shifted
-    versions of each other across consecutive "bytes", a classic sign of
-    aliasing against a periodic pattern rather than true byte alignment.
-    Likely cause: this is a single-ended probe of what's probably a
-    differential (RS-485-class) line, and the resulting ringing/reflections
-    are enough to defeat a naive edge-based decode. A real logic analyzer
-    (or the RP2040's own receiver on real hardware, immune to that scope
-    probing issue) is needed for a trustworthy byte layout -- see
-    "Falcon hunt capture" below.
-  - Open hypothesis: the packet may be per-receiver rather than one fixed
-    payload -- e.g. occurrence N describing the 1st configured virtual
-    receiver, N+1 the 2nd, N+2 the 3rd, cycling. Tested against the scope
-    capture two ways (per-occurrence pulse count: 55-59, no clean grouping;
-    a periodicity score across candidate cycle lengths 1-11 on the decoded
-    bytes: period 3 wasn't the winner) but neither is conclusive given the
-    decode-quality caveat above, and this capture's 3 receivers all shared
-    the same pixel count, so a per-receiver field might be small enough to
-    be lost in the noise anyway. The hunt-capture batch mode below is built
-    to test this cleanly.
+- **Falcon v2 (info-packet-framed):** addressing works differently than
+  FPP v2 here -- Falcon's own pixel data isn't gap-delimited at all (one
+  continuous run per port), with addressing instead coming from a periodic
+  info packet carrying this receiver's own pixel range within that stream.
+  Gating for it is therefore *pixel-position*-based rather than *gap*-based:
+  `PixelGapReceiver::setPixelRangeGating(startPixel, count)` opens `EN_n`
+  when the running pixel count reaches `startPixel` and closes it at
+  `startPixel+count`, hooked directly in `pushBit()` rather than
+  `onLowPulse()`'s gap/reset handling.
+  `PixelGapReceiver::suspectedFalconV2()` auto-detects per port whether its
+  traffic looks like Falcon v2 at all, via an anomalously long *high* pulse
+  right after pixel data ends (never happens for a real WS281x bit, and a
+  cleaner signal than trying to classify *low*-pulse durations, which
+  legitimately overlap with real FPP v2 gap timing) -- that same signature
+  now also arms an inline UART deserializer that decodes the info packet
+  live (800000 baud, i.e. `kFalconBitPeriodNs` = 1.25us/bit in
+  `PixelGapReceiver.h` -- the same 800kHz rate as the WS2812 pixel data
+  itself, presumably so the transmitter can drive both off one clock) and
+  calls `setPixelRangeGating()` with this receiver's actual computed range,
+  self-selected using the board's dial ID and each port's own index. The
+  16-bit channel-count fields are little-endian (confirmed against a real
+  capture with a known 5-pixel receiver -- see below). A sync/validation
+  check discards any single corrupted occurrence rather than risking a
+  garbage gating window; the packet repeats often enough that this costs
+  nothing. `F` on the OLED still flags a port as Falcon-suspected the same
+  as before.
+  Used a scope capture (per-byte decode with framing-error flags, known
+  single-receiver/5-pixel test config, saved under `captures/`): every
+  occurrence decoded with zero framing errors at the
+  implemented timing. That check caught the byte order being backwards
+  (originally assumed big-endian); fixed to little-endian, confirmed by an
+  exact match against the known 5-pixel config (15 channels). Still
+  outstanding: an end-to-end check with a real LED string on `EN_n` to
+  confirm the computed range actually gates correctly -- see "Needs real
+  hardware to finish" below. (An earlier, extensive attempt to
+  reverse-engineer this packet's byte layout purely from scope captures --
+  documented in prior revisions of this file -- had concluded it wasn't
+  decodable that way; that conclusion turned out to be an artifact of the
+  capture tooling misinterpreting the signal's actual bit rate, not a real
+  dead end. Superseded by the implementation above.)
 
 #### Falcon hunt capture
 
@@ -215,10 +223,16 @@ replay.
    `boardAddress`. Not verifiable from this session alone -- no LEDs were
    connected to check visually, and this specific behavior wasn't exercised
    before the architecture correction.
-2. Run the Falcon hunt capture (see "Falcon hunt capture" above) against a
-   real Falcon v2 controller to get a clean, on-device capture of the
-   post-pixel-data packet, then reverse-engineer its byte layout -- the scope
-   capture analyzed so far isn't reliable enough to decode byte-for-byte.
+2. Falcon v2 info-packet decode + pixel-range gating is implemented and its
+   byte layout/timing validated against a real scope capture (see "Protocol
+   support" above) -- zero framing errors, computed range matched a known
+   5-pixel test exactly. Still needed: an end-to-end check with a real LED
+   string on `EN_n` to confirm the computed range actually gates correctly
+   on real hardware, not just that the packet decodes correctly. `main.cpp`'s
+   `dumpFalconInfo()` prints each decoded packet's raw bytes and the
+   resulting gate mode over serial for this. Remove its call site once
+   confirmed -- it's bring-up instrumentation only, and prints on every
+   decode (~every 11 frames) for any Falcon-suspected port.
 3. Confirm the dial's electrical polarity once a board with the dial
    populated is available (currently assumed active-low with internal
    pull-ups -- `dial.h`).

@@ -40,18 +40,19 @@ static uint32_t framesRouted[4] = {0, 0, 0, 0};
 // "Time [s],Channel 0" CSV format an oscilloscope export uses, so it can be
 // fed straight into the same offline analysis tooling.
 //
-// Window widened to 22ms (2026-08-24): a live capture at the original 3ms
-// window kept getting cut short mid-cycle -- the window-timeout check only
-// runs when an edge arrives, so during a long quiet stretch with no edges it
-// doesn't fire until whatever edge comes next, however much later that is.
-// That accidentally revealed real reset-to-reset periods of ~23.9-24.0ms
-// with a second burst of activity ~16.7ms into the cycle, which a 3ms window
-// can't capture cleanly. 22ms is deliberately just *under* that observed
-// cadence: since huntOnReset() restarts the window on every reset, a window
-// longer than the cadence (e.g. 30ms) would keep getting restarted before it
-// can time out, only completing on the rare larger gap -- 22ms instead times
-// out on nearly every single cycle, ending well before the next reset while
-// still covering the whole span from reset to that second burst and beyond.
+// Window widened to 22ms, then to 23.8ms (2026-08-24): a live capture at the
+// original 3ms window kept getting cut short mid-cycle -- the window-timeout
+// check only runs when an edge arrives, so during a long quiet stretch with
+// no edges it doesn't fire until whatever edge comes next, however much
+// later that is. That accidentally revealed real reset-to-reset periods of
+// ~23.9-24.0ms with a second burst of activity ~16.7ms into the cycle, which
+// a 3ms window can't capture cleanly. Since huntOnReset() restarts the
+// window on every reset, a window has to stay *under* that observed cadence
+// to reliably time out on its own (rather than only completing on the rare
+// larger gap) -- but 22ms turned out to leave a ~2ms blind spot right before
+// every reset that a config packet sitting late in the cycle would fall
+// into and never get captured. 23.8ms trades a little of that reliability
+// margin to shrink the blind spot to ~100-200us instead.
 //
 // Captures kHuntBatchSize *consecutive* occurrences per button press (not
 // just one) so the dumps can be diffed against each other -- e.g. to check
@@ -66,10 +67,17 @@ static uint32_t framesRouted[4] = {0, 0, 0, 0};
 // UART-burst-scale, not pixel-scale); everything else gets a one-line
 // summary. For verifying actual pixel *content* (e.g. against a known solid
 // color set on the transmitter), set it false to always get the full dump.
+// kHuntBatchSize bumped to 400 (2026-08-24): told the config packet should
+// recur every 12th frame at 20fps (~600ms) -- but our own measured wire-level
+// reset period has been rock-solid at ~24ms all session, not 50ms, so it's
+// unclear whether that 12-frame count is against this wire rate (~288ms) or
+// the show's logical frame rate (~600ms). Rather than guess which, 400
+// cycles (~9.6s at ~24ms/cycle) comfortably spans several repetitions either
+// way.
 static constexpr int kHuntCapacity = 1000;
-static constexpr uint32_t kHuntWindowUs = 22000;
-static constexpr int kHuntBatchSize = 3;
-static constexpr bool kSkipUninteresting = false;
+static constexpr uint32_t kHuntWindowUs = 23800;
+static constexpr int kHuntBatchSize = 400;
+static constexpr bool kSkipUninteresting = true;
 static constexpr uint32_t kInterestingDurationMinNs = 4000;
 static constexpr uint32_t kInterestingDurationMaxNs = 200000;
 static PixelGapReceiver::RawEdge huntBuf[kHuntCapacity];
@@ -126,6 +134,37 @@ static void dumpHuntCapture(int port) {
         t += huntBuf[i].durationNs / 1e9;
     }
     Serial.println("--- end capture ---");
+}
+
+// Temporary bring-up instrumentation: whenever a receiver decodes an info
+// packet (sync byte checked out), dump its raw bytes and the resulting
+// gating decision over serial so the byte layout can be sanity-checked
+// against a known configuration on real hardware -- e.g. does the reported
+// pixel count match what's actually configured for this receiver? Fires on
+// every decode (~every 11 frames) for any port that looks like Falcon v2, so
+// expect it to be noisy; remove once the layout's confirmed.
+static void dumpFalconInfo(int port) {
+    uint8_t reason = receivers[port].falconAbortReason();
+    if (reason != 0) {
+        Serial.print("falcon info: port ");
+        Serial.print(port + 1);
+        Serial.print(" FAILED reason=");
+        Serial.print(reason); // 1=bad start bit, 2=bad stop bit, 3=timeout, 4=sync mismatch
+        Serial.print(" at byte ");
+        Serial.println(receivers[port].falconAbortByteIndex());
+        return;
+    }
+    Serial.print("falcon info: port ");
+    Serial.print(port + 1);
+    Serial.print(" bytes=[");
+    const uint8_t *b = receivers[port].falconInfoBytes();
+    for (int i = 0; i < PixelGapReceiver::kFalconInfoByteCount; i++) {
+        if (i) Serial.print(',');
+        Serial.print(b[i]);
+    }
+    Serial.print("] gateMode=");
+    Serial.print((int)receivers[port].gateMode());
+    Serial.println();
 }
 
 // Applies a dial reading to all 4 receivers' gating -- called once at boot
@@ -271,7 +310,13 @@ static void updateDisplay() {
         display.print(receivers[i].segmentCount());
         display.print("seg ");
         display.print(framesRouted[i]);
-        display.println("f");
+        display.print("f");
+        // "F" flags a port whose traffic looks like Falcon v2 (an
+        // anomalously long high pulse after real pixel data -- see
+        // PixelGapReceiver::suspectedFalconV2()) rather than plain FPP v2.
+        // Diagnostic only -- doesn't change how the port is gated yet.
+        if (receivers[i].suspectedFalconV2()) display.print(" F");
+        display.println();
     }
     display.display();
 }
@@ -319,6 +364,7 @@ void setup() {
     for (int i = 0; i < 4; i++) {
         receivers[i].begin(pio0, kDataPins[i]);
         receivers[i].configureGating(kEnPins[i], kEnableActiveHigh);
+        receivers[i].setFalconPortIndex(i);
         checkpoint(3 + i, "receiver started"); // checkpoints 3-6, one per port
     }
     applyBoardAddress(boardAddress);
@@ -342,6 +388,12 @@ void loop() {
         serviceTestMode();
     } else {
         routeReadyFrames();
+        for (int i = 0; i < 4; i++) {
+            if (receivers[i].falconInfoReady()) {
+                dumpFalconInfo(i);
+                receivers[i].consumeFalconInfo();
+            }
+        }
     }
 
     static uint32_t lastDisplay = 0;

@@ -30,6 +30,8 @@ public:
         uint16_t count;
     };
 
+    enum class GateMode { kSegment, kDumb, kPixelRange };
+
     void begin(PIO pio, uint pin, float sampleHz = 2000000.0f) {
         pio_ = pio;
         pin_ = pin;
@@ -136,13 +138,13 @@ public:
     // "decode a segment, then replay it" -- it's "count gaps as they go by,
     // and hold the gate open for exactly the live segment matching our
     // address," done from onLowPulse() as gaps/resets are recognized, with
-    // no dependency on the bit/pixel decode below (that's diagnostic-only,
-    // for the OLED). Call once per receiver right after begin() to assign the
-    // pin, then setTargetSegment()/setDumbMode() to pick a mode -- both of
-    // those are safe to call again later too (e.g. a live dial change), and
-    // take effect immediately (closing the gate now, letting the next
-    // segment-boundary event reopen it correctly) rather than waiting for a
-    // reset to notice.
+    // no dependency on the bit/pixel decode below (used only diagnostically
+    // otherwise, for the OLED). Call once per receiver right after begin()
+    // to assign the pin, then setTargetSegment()/setDumbMode()/
+    // setPixelRangeGating() to pick a mode -- all three are safe to call
+    // again later too (e.g. a live dial change), and take effect immediately
+    // (closing the gate now, letting the next boundary event reopen it
+    // correctly) rather than waiting for a reset to notice.
     void configureGating(uint enPin, bool enableActiveHigh) {
         gateEnPin_ = enPin;
         gateActiveHigh_ = enableActiveHigh;
@@ -151,7 +153,7 @@ public:
 
     void setTargetSegment(uint8_t targetSegment) {
         gateTargetSegment_ = targetSegment;
-        gateDumbMode_ = false;
+        gateMode_ = GateMode::kSegment;
         gateSegmentIndex_ = 0;
         setGate(false);
     }
@@ -162,8 +164,24 @@ public:
     // unlike a specific target segment (see the gating edge-case note in the
     // README): it doesn't depend on gaps ever occurring.
     void setDumbMode() {
-        gateDumbMode_ = true;
+        gateMode_ = GateMode::kDumb;
         setGate(true);
+    }
+
+    // Falcon v2 addressing: unlike FPP v2, Falcon's own pixel data doesn't
+    // appear to use gap-delimited segments at all (see README) -- addressing
+    // instead comes from a separate config packet giving this receiver's
+    // pixel range within one continuous composite stream. Byte decode of
+    // that packet isn't implemented yet (still unknown -- see
+    // suspectedFalconV2() below and the README), so `startPixel`/`count`
+    // have to come from somewhere else for now (e.g. hardcoded for a bench
+    // test) until that's wired in. Takes effect on the pixel *count*
+    // reaching these bounds (hooked in pushBit()), not on gaps/resets.
+    void setPixelRangeGating(uint16_t startPixel, uint16_t count) {
+        gateStartPixel_ = startPixel;
+        gateEndPixel_ = startPixel + count;
+        gateMode_ = GateMode::kPixelRange;
+        setGate(false);
     }
 
     // For when something else drives EN_n directly, bypassing setGate() (e.g.
@@ -171,6 +189,42 @@ public:
     // redundant-write dedupe doesn't skip a write that's actually needed once
     // control returns here. Doesn't touch the pin itself.
     void syncGateState(bool open) { gateOpen_ = open; }
+
+    // Best-effort, sticky (not cleared per-frame -- meant to answer "does
+    // this port's traffic look like Falcon v2", a fixed property of what's
+    // connected there) flag for whether this port's traffic looks like
+    // Falcon v2 rather than plain FPP v2. Set in onHighPulse() -- see the
+    // comment there for why an anomalously long *high* pulse, not a low-side
+    // duration band, is the signature used. As of the info-packet decode
+    // below, this also marks the point where the UART deserializer arms
+    // itself for the burst that follows.
+    bool suspectedFalconV2() const { return sawFalconBurst_; }
+
+    // Which of the board's 4 physical ports this instance is (0-3). Needed
+    // to pick this receiver's own column out of the decoded info packet's
+    // per-port channel table (see finishInfoPacketDecode()) -- call once
+    // from setup(), alongside configureGating().
+    void setFalconPortIndex(uint8_t portIndex) { falconPortIndex_ = portIndex; }
+
+    // One-shot (like frameReady()/huntCaptureReady()): true once a fresh
+    // info packet has been captured and passed its sync check, whether or
+    // not it ended up changing this receiver's gating (e.g. dumb-mode ports
+    // decode it but don't act on it). Meant for a temporary bring-up dump
+    // (see main.cpp) to verify the byte layout against known configuration
+    // on real hardware; not needed for gating itself, which applies
+    // immediately inside finishInfoPacketDecode().
+    bool falconInfoReady() const { return falconInfoReady_; }
+    void consumeFalconInfo() { falconInfoReady_ = false; }
+    static constexpr int kFalconInfoByteCount = 57;
+    const uint8_t *falconInfoBytes() const { return uartByteBuf_; }
+    GateMode gateMode() const { return gateMode_; }
+
+    // 0=completed all 57 bytes (check falconInfoBytes()[0] for sync pass/
+    // fail), 1=bad start bit, 2=bad stop bit, 3=timed out mid-burst, 4=byte
+    // count completed but sync byte didn't match, 5=implausibly long single
+    // pulse (safety abort, see kFalconMaxBitsPerPulse). See uartAbort() above.
+    uint8_t falconAbortReason() const { return falconAbortReason_; }
+    int falconAbortByteIndex() const { return falconAbortByteIndex_; }
 
 private:
     void resetFrameState() {
@@ -204,6 +258,29 @@ private:
     }
 
     void onHighPulse(float durationNs) {
+        // Falcon v2 detection: a real WS281x "1" bit never gets anywhere
+        // near kGapThresholdNs (20us) even on the slowest variants (~1.2us).
+        // A real capture of Falcon's post-pixel-data traffic (see README)
+        // showed a sustained ~54us high (idle/mark) right after pixel data
+        // ends and before its UART-scale burst -- wildly anomalous for a bit
+        // pulse, and a much cleaner signature than trying to classify *low*
+        // pulse durations, which legitimately overlap with real FPP v2 gap
+        // timing (~102.5-105us in that protocol's own capture). Requiring at
+        // least one real pixel already decoded this frame keeps this from
+        // false-triggering on, say, a long pre-frame idle high.
+        if (durationNs > kGapThresholdNs && pixelCount_ > 0) {
+            sawFalconBurst_ = true;
+            startInfoPacketCapture(); // arm the UART deserializer for the
+                                       // burst that follows this pulse --
+                                       // see the block above onLowPulse().
+            return; // clearly not a real bit -- don't let it poison the
+                     // adaptive short/long threshold below for the rest of
+                     // this frame's (diagnostic-only) pixel decode.
+        }
+        if (uartActive_) {
+            uartOnPulse(1, durationNs);
+            return;
+        }
         // Adaptive short/long threshold: track the shortest and longest high
         // pulses seen so far this frame and split at their midpoint. Robust
         // to different WS281x variants without hardcoding exact timing.
@@ -225,24 +302,168 @@ private:
     static constexpr float kGapThresholdNs = 20000.0f;    // > this: virtual-receiver boundary
     static constexpr float kResetThresholdNs = 150000.0f; // > this: end of composite frame
 
+    // Info-packet UART deserializer: decodes the fixed-length burst that
+    // follows the anomalous high pulse classified in onHighPulse() above.
+    // Driven directly off the same pulse callbacks rather than a separate
+    // buffered replay -- each pulse's duration is converted to a whole
+    // number of bit-times (rounded, with the remainder carried into the
+    // next pulse so error doesn't accumulate across the burst) and expanded
+    // into that many repeated bits of the pulse's level, fed one at a time
+    // into a standard start/8-data/stop-bit byte framer.
+    static constexpr float kFalconBitPeriodNs = 1250.0f;
+    static constexpr uint8_t kFalconSyncByte = 0xAA;
+    static constexpr int kFalconChannelWords = 24; // (57 - 9) / 2
+    static constexpr uint32_t kFalconUartTimeoutUs = 2000; // >> ~712us expected
+
+    void startInfoPacketCapture() {
+        uartActive_ = true;
+        uartTimeDebtNs_ = 0.0f;
+        uartBitPos_ = 0;
+        uartByteAccum_ = 0;
+        uartByteIndex_ = 0;
+        uartStartUs_ = micros();
+    }
+
+    // reason: 1=bad start bit, 2=bad stop bit, 3=timeout -- temporary
+    // bring-up diagnostics (see falconAbortReason()/main.cpp's
+    // dumpFalconInfo()) to see how far a failed decode got without needing
+    // a scope, since a silent abort otherwise looks identical to "no signal
+    // at all" from the outside.
+    void uartAbort(uint8_t reason) {
+        uartActive_ = false;
+        falconAbortReason_ = reason;
+        falconAbortByteIndex_ = uartByteIndex_;
+        falconInfoReady_ = true;
+        uartBitPos_ = 0;
+        uartByteIndex_ = 0;
+    }
+
+    void uartFeedBit(uint32_t bit) {
+        if (uartBitPos_ == 0) {
+            if (bit != 0) { uartAbort(1); return; } // start bit must be low
+            uartByteAccum_ = 0;
+            uartBitPos_ = 1;
+            return;
+        }
+        if (uartBitPos_ <= 8) {
+            uartByteAccum_ |= (uint8_t)(bit << (uartBitPos_ - 1)); // LSB first
+            uartBitPos_++;
+            return;
+        }
+        // uartBitPos_ == 9: stop bit.
+        if (bit != 1) { uartAbort(2); return; }
+        uartByteBuf_[uartByteIndex_++] = uartByteAccum_;
+        uartBitPos_ = 0;
+        if (uartByteIndex_ >= kFalconInfoByteCount) {
+            uartActive_ = false;
+            falconAbortReason_ = 0; // 0 = completed, see finishInfoPacketDecode()
+            finishInfoPacketDecode();
+        }
+    }
+
+    // A single legitimate pulse can never span more than ~9-10 bit-times
+    // (start/stop framing guarantees a level change at least that often --
+    // see uartFeedBit()), so this is a generous safety margin, not a normal
+    // codepath. Without it, a single implausibly long pulse fed in here by
+    // mistake (e.g. if uartActive_ were ever left stuck true across a
+    // multi-hundred-ms idle gap by a bug elsewhere) would iterate the loop
+    // below hundreds of thousands of times before returning, stalling
+    // poll() long enough to starve the other 3 ports' PIO FIFOs -- this
+    // caps the damage to one aborted packet instead.
+    static constexpr int kFalconMaxBitsPerPulse = 32;
+
+    void uartOnPulse(uint32_t level, float durationNs) {
+        if (micros() - uartStartUs_ > kFalconUartTimeoutUs) { uartAbort(3); return; }
+        uartTimeDebtNs_ += durationNs;
+        int bitsThisPulse = 0;
+        while (uartTimeDebtNs_ >= kFalconBitPeriodNs * 0.5f) {
+            if (++bitsThisPulse > kFalconMaxBitsPerPulse) { uartAbort(5); return; }
+            uartTimeDebtNs_ -= kFalconBitPeriodNs;
+            uartFeedBit(level);
+            if (!uartActive_) return; // completed or aborted mid-pulse
+        }
+    }
+
+    // Byte 0 is a fixed sync value -- treated as a sanity check, not
+    // protocol content: a mismatch means a misaligned/corrupted capture of
+    // this occurrence, discarded outright rather than risking a garbage
+    // gating window (the transmitter repeats this packet every ~11 frames,
+    // so one dropped occurrence costs nothing). Bytes 9.. are 24
+    // little-endian 16-bit cumulative channel counts, 4 per chain position
+    // (this board's dial ID, 0-based) across the board's 4 physical ports --
+    // confirmed against a real capture with a known 5-pixel receiver (byte
+    // order gave exactly 15 channels = 5 * 3; big-endian gave a nonsensical
+    // 1280).
+    void finishInfoPacketDecode() {
+        falconInfoReady_ = true; // available for the bring-up dump either way
+        if (uartByteBuf_[0] != kFalconSyncByte) { falconAbortReason_ = 4; return; }
+        // Dumb mode intentionally wants everything unfiltered -- leave it
+        // alone. Otherwise apply on every valid decode, not just the first:
+        // once switched to kPixelRange (below), keep refreshing the range
+        // in case the show's channel counts change later, rather than
+        // latching the *values* -- only the *mode* switch is one-way.
+        if (gateMode_ == GateMode::kDumb) return;
+        uint8_t letterIdx = gateTargetSegment_;
+        if (letterIdx >= 6) return;
+        uint16_t channels[kFalconChannelWords];
+        for (int w = 0; w < kFalconChannelWords; w++) {
+            int off = 9 + w * 2;
+            channels[w] = ((uint16_t)uartByteBuf_[off + 1] << 8) | uartByteBuf_[off];
+        }
+        int idx = letterIdx * 4 + falconPortIndex_;
+        uint16_t endCh = channels[idx];
+        if (endCh == 0xFFFF) return; // this chain position isn't configured
+        uint16_t startCh = (letterIdx == 0) ? 0 : channels[idx - 4];
+        if (endCh <= startCh) return; // corrupt/implausible table, discard
+        setPixelRangeGating(startCh / 3, (endCh - startCh) / 3); // RGB: 3 channels/pixel
+    }
+
+    bool uartActive_ = false;
+    float uartTimeDebtNs_ = 0.0f;
+    int uartBitPos_ = 0; // 0=expecting start bit, 1-8=data bits, 9=stop bit
+    uint8_t uartByteAccum_ = 0;
+    uint8_t uartByteBuf_[kFalconInfoByteCount];
+    int uartByteIndex_ = 0;
+    uint32_t uartStartUs_ = 0;
+    uint8_t falconPortIndex_ = 0;
+    bool falconInfoReady_ = false;
+    uint8_t falconAbortReason_ = 0;
+    int falconAbortByteIndex_ = 0;
+
     void onLowPulse(float durationNs) {
+        if (uartActive_) {
+            // Mid-burst: every low pulse here is UART bit content (the
+            // burst's own pulses are all well under kGapThresholdNs -- see
+            // the comment at startInfoPacketCapture() -- so this can't
+            // collide with real gap/reset classification below).
+            uartOnPulse(0, durationNs);
+            return;
+        }
         if (durationNs > kResetThresholdNs) {
             // Long reset: end of the whole composite frame.
-            if (gatingConfigured_ && !gateDumbMode_) {
-                setGate(false);
-                gateSegmentIndex_ = 0;
-                // Segment 0 of the *new* frame starts right now -- opening
-                // here (rather than only on a gap) is what makes an address-0
-                // receiver handle a gap-less direct-feed frame correctly too,
-                // since that case never reaches the gap branch below at all.
-                if (gateTargetSegment_ == 0) setGate(true);
+            if (gatingConfigured_) {
+                if (gateMode_ == GateMode::kSegment) {
+                    setGate(false);
+                    gateSegmentIndex_ = 0;
+                    // Segment 0 of the *new* frame starts right now --
+                    // opening here (rather than only on a gap) is what makes
+                    // an address-0 receiver handle a gap-less direct-feed
+                    // frame correctly too, since that case never reaches the
+                    // gap branch below at all.
+                    if (gateTargetSegment_ == 0) setGate(true);
+                } else if (gateMode_ == GateMode::kPixelRange) {
+                    // Safety: don't let a still-open pixel-range gate carry
+                    // across a frame boundary if gateEndPixel_ was never
+                    // reached this frame (e.g. a short/corrupt frame).
+                    setGate(false);
+                }
             }
             closeSegment();
             frameReady_ = (segmentCount_ > 0);
             huntOnReset();
         } else if (durationNs > kGapThresholdNs) {
             // Gap: boundary between two virtual receivers' segments.
-            if (gatingConfigured_ && !gateDumbMode_) {
+            if (gatingConfigured_ && gateMode_ == GateMode::kSegment) {
                 if (gateSegmentIndex_ == gateTargetSegment_) setGate(false);
                 gateSegmentIndex_++;
                 if (gateSegmentIndex_ == gateTargetSegment_) setGate(true);
@@ -264,6 +485,14 @@ private:
         if (bitCount_ == 24) {
             if (pixelCount_ < kMaxPixelsPerPort) {
                 pixels_[pixelCount_++] = bitAccum_;
+                // Falcon v2 addressing (see setPixelRangeGating()): unlike
+                // kSegment mode, this doesn't wait for a gap/reset event --
+                // the running pixel count itself is the only signal, since
+                // Falcon's pixel data isn't gap-delimited.
+                if (gatingConfigured_ && gateMode_ == GateMode::kPixelRange) {
+                    if (pixelCount_ == gateStartPixel_) setGate(true);
+                    if (pixelCount_ == gateEndPixel_) setGate(false);
+                }
             }
             bitAccum_ = 0;
             bitCount_ = 0;
@@ -347,9 +576,12 @@ private:
     bool gateActiveHigh_ = false;
     uint8_t gateTargetSegment_ = 0;
     bool gatingConfigured_ = false;
-    bool gateDumbMode_ = false;
+    GateMode gateMode_ = GateMode::kSegment;
     int gateSegmentIndex_ = 0;
     bool gateOpen_ = false;
+    uint16_t gateStartPixel_ = 0;
+    uint16_t gateEndPixel_ = 0;
+    bool sawFalconBurst_ = false;
 
     PIO pio_ = nullptr;
     uint pin_ = 0;
