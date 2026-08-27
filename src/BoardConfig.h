@@ -1,10 +1,28 @@
 #pragma once
 
-// Pin mapping for the PB16 "SM Receiver Out SMD" board (RP2040, Pico module).
-// Net names below match Micro.kicad_sch / Outputs.kicad_sch / Diff_In.kicad_sch
-// in https://github.com/computergeek1507/PB_16/tree/master/SM_Receiver_Out_SMD
+// Pin mapping for the PB16 "SM Receiver Out SMD" board. Two hardware
+// revisions are supported, selected by which PlatformIO environment you
+// build (see platformio.ini's sm_receiver_rev1/sm_receiver_rev2, which set
+// -D BOARD_REV1 / -D BOARD_REV2 respectively):
 //
-// All pin numbers below are confirmed against the board.
+//   REV1: Pico module. Net names match Micro.kicad_sch/Outputs.kicad_sch/
+//         Diff_In.kicad_sch in
+//         https://github.com/computergeek1507/PB_16/tree/master/SM_Receiver_Out_SMD.
+//         Current hardware -- pin numbers confirmed against a real board.
+//   REV2: Waveshare RP2040-Tiny, to shrink the PCB. EN1-4 and the address
+//         dial moved off REV1's GPIO10-13/19-21 because the RP2040-Tiny's
+//         header doesn't break out GPIO18-25 at all (GPIO16/17 are used
+//         on-board for its own WS2812 status LED) -- see its schematic:
+//         https://files.waveshare.com/upload/7/7a/RP2040-Tiny_Schematic.pdf.
+//         Not yet built -- pin numbers are a planned repin, not confirmed
+//         against real hardware.
+//
+// Every other pin (DATA1-4, DIFF_EN, status LED, test button, OLED) is
+// identical on both revisions.
+
+#if !defined(BOARD_REV1) && !defined(BOARD_REV2)
+#error "Define BOARD_REV1 or BOARD_REV2 (see platformio.ini environments)"
+#endif
 
 // Each of the 4 ports shares ONE GPIO pin for both directions: as DATA_n it
 // reads the incoming differential stream (controller/upstream), and the same
@@ -20,27 +38,37 @@
 #define PIN_DOUT3 PIN_DATA3
 #define PIN_DOUT4 PIN_DATA4
 
-// Per-port output driver enables (must be driven active before DOUT_n will
-// actually drive its string). DIFF_EN enables the shared input differential
-// receiver for DATA1-4.
-#define PIN_EN1 10
-#define PIN_EN2 11
-#define PIN_EN3 12
-#define PIN_EN4 13
-
 #define PIN_DIFF_EN 8
 
 // Status / UI.
 #define PIN_STATUS_LED 6
 #define PIN_TEST_BUTTON 7
 
-// Board-address rotary dial (SW1, Nidec Copal SH-7010, 10-position BCD).
-// Only the weight-1/2/4 bits are wired -- weight-8 is not connected, so the
-// dial only distinguishes addresses 0-7; positions 8 and 9 are not usable
-// as distinct addresses.
+// Per-port output driver enables (must be driven active before DOUT_n will
+// actually drive its string), and the board-address rotary dial (SW1,
+// Nidec Copal SH-7010, 10-position BCD -- only the weight-1/2/4 bits are
+// wired, so the dial only distinguishes addresses 0-7; positions 8 and 9
+// are not usable as distinct addresses). These are the only pins that
+// differ between revisions -- see the file header above for why.
+#if defined(BOARD_REV2)
+#define PIN_EN1 9
+#define PIN_EN2 10
+#define PIN_EN3 11
+#define PIN_EN4 12
+
+#define PIN_DIAL_BIT1 13
+#define PIN_DIAL_BIT2 14
+#define PIN_DIAL_BIT4 15
+#else // BOARD_REV1
+#define PIN_EN1 10
+#define PIN_EN2 11
+#define PIN_EN3 12
+#define PIN_EN4 13
+
 #define PIN_DIAL_BIT1 19
 #define PIN_DIAL_BIT2 20
 #define PIN_DIAL_BIT4 21
+#endif
 
 // OLED (SSD1306, 128x64) on I2C1.
 #define PIN_OLED_SDA 26
